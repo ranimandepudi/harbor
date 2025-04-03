@@ -60,3 +60,7 @@ src/server/v2.0/restapi/
 harborclient/
 openapi-generator-cli.jar
 tests/e2e_setup/robotvars.py
+go1.23.8.linux-amd64.tar.gz
+harbor-offline-installer-dev.tgz
+make/photon/core/harbor_core
+make/photon/jobservice/harbor_jobservice
