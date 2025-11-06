@@ -103,30 +103,39 @@ jobs:
           docker_version: 20.10
           docker_channel: stable
 
+      
       - name: Publish Images (amd64 + arm64)
         env:
           CUR_TAG: ${{ env.CUR_TAG }}
-          ASSETS_TAG: ${{ env.ASSETS_TAG }}
+          OFFLINE_AMD64: ${{ env.OFFLINE_AMD64 }}
+          OFFLINE_ARM64: ${{ env.OFFLINE_ARM64 }}
         run: |
           set -euo pipefail
           docker login -u "${{ secrets.DOCKER_HUB_USERNAME }}" -p "${{ secrets.DOCKER_HUB_PASSWORD }}"
           : > "$GITHUB_WORKSPACE/_repos.txt"
 
           for arch in amd64 arm64; do
-            pkg="$PWD/assets/harbor-offline-installer-${ASSETS_TAG}-${arch}.tgz"
-            echo "Processing $pkg"
+            pkg_var="OFFLINE_${arch^^}"
+            pkg="${!pkg_var}"
+            echo "Processing offline bundle: ${pkg}"
             tar -zxf "$pkg"
 
-            inner_tar="$(ls -1 harbor/harbor*.tar.gz | head -n1)"
+            # find inner tar (name varies: harbor.*.tar.gz)
+            inner_tar="$(ls -1 harbor/harbor*.tar.gz | head -n1 || true)"
+            if [ -z "${inner_tar}" ]; then
+              echo "ERROR: No harbor*.tar.gz inside $(basename "$pkg"). Did you upload ONLINE instead of OFFLINE?"
+              exit 1
+            fi
             docker load -i "$inner_tar"
 
-            mapfile -t imgs < <(docker images --format "{{.Repository}}:{{.Tag}}" \
-              | grep "^ranichowdary/.\\+:" || true)
+            # collect your repos tagged with CUR_TAG (ranichowdary/*:v2.14.0-test)
+            mapfile -t imgs < <(docker images --format '{{.Repository}}:{{.Tag}}' \
+              | grep "^ranichowdary/.\\+:${CUR_TAG}$" || true)
 
-            # Retag every loaded image as :${CUR_TAG}-${arch}, and push
+            # retag with -arch suffix and push
             for it in "${imgs[@]}"; do
               repo="${it%:*}"
-              docker tag "${it}" "${repo}:${CUR_TAG}-${arch}"
+              docker tag  "${it}" "${repo}:${CUR_TAG}-${arch}"
               docker push "${repo}:${CUR_TAG}-${arch}"
               echo "${repo}" >> "$GITHUB_WORKSPACE/_repos.txt"
             done
@@ -136,7 +145,6 @@ jobs:
 
           sort -u "$GITHUB_WORKSPACE/_repos.txt" -o "$GITHUB_WORKSPACE/_repos.txt"
           docker logout
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
@@ -157,6 +165,7 @@ jobs:
           done < "$GITHUB_WORKSPACE/_repos.txt"
           docker logout
 
+      
       - name: GA Release (re-attach installers to publish tag if needed)
         uses: softprops/action-gh-release@v2
         with:
