@@ -28,31 +28,57 @@ jobs:
         run: |
           TAG="${{ github.event.inputs.release_tag || github.ref_name }}"
           echo "TAG=$TAG" >> $GITHUB_ENV
-      - name: Prepare Assets (amd64 + arm64) — from GitHub Release
+
+      
+      - name: Prepare Assets (amd64 + arm64) — from Release (API + direct URL fallback)
         env:
           REPO: ${{ github.repository }}
-          TAG:  ${{ env.TAG }}
+          TAG:  ${{ env.TAG }}             
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           assets_path="$PWD/assets"
           mkdir -p "$assets_path"
 
-          rel_json=$(curl -fsSL \
+          echo "Using release tag: ${TAG}"
+
+          # Try to list assets via API (nice for private repos), but don't die if it fails.
+          rel_json="$(curl -fsSL \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/releases/tags/${TAG}")
+            "https://api.github.com/repos/${REPO}/releases/tags/${TAG}" || true)"
 
           download() {
             name="$1"
-            url=$(echo "$rel_json" | jq -r ".assets[] | select(.name==\"${name}\") | .browser_download_url")
-            [ -n "$url" ] && curl -fL "$url" -o "${assets_path}/${name}" || { echo "missing asset: ${name}"; exit 1; }
+            # 1) Try to find browser_download_url in API JSON
+            api_url="$(echo "$rel_json" | jq -r ".assets[]? | select(.name==\"${name}\") | .browser_download_url" 2>/dev/null || true)"
+            if [ -n "${api_url}" ] && [ "${api_url}" != "null" ]; then
+              echo "→ downloading via API url: ${name}"
+              curl -fL -H "Authorization: Bearer ${GH_TOKEN}" "$api_url" -o "${assets_path}/${name}" && return 0
+            fi
+            # 2) Fallback to direct “releases/download/<tag>/<name>” URL
+            fallback_url="https://github.com/${REPO}/releases/download/${TAG}/${name}"
+            echo "→ API url not found; trying direct URL: ${fallback_url}"
+            curl -fL -H "Authorization: Bearer ${GH_TOKEN}" "$fallback_url" -o "${assets_path}/${name}"
           }
 
+          # Required files (exactly the names you’re using)
           download "harbor-offline-installer-${TAG}-amd64.tgz"
           download "harbor-offline-installer-${TAG}-arm64.tgz"
           download "harbor-online-installer-${TAG}-amd64.tgz"
           download "harbor-online-installer-${TAG}-arm64.tgz"
+
+          # Optional checksums if you uploaded them (no-fail if missing)
+          for f in \
+            "harbor-offline-installer-${TAG}-amd64.tgz.sha256" \
+            "harbor-offline-installer-${TAG}-arm64.tgz.sha256" \
+            "harbor-online-installer-${TAG}-amd64.tgz.sha256" \
+            "harbor-online-installer-${TAG}-arm64.tgz.sha256"
+          do
+            curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
+              "https://github.com/${REPO}/releases/download/${TAG}/${f}" \
+              -o "${assets_path}/${f}" || true
+          done
 
           (cd "${assets_path}" && md5sum *.tgz | tee md5sum)
 
