@@ -33,6 +33,7 @@ jobs:
           echo "CUR_TAG=$PUBLISH_TAG"  >> $GITHUB_ENV
           echo "ASSETS_TAG=$ASSETS_TAG" >> $GITHUB_ENV
 
+      
       - name: Prepare Assets (amd64 + arm64) — from GitHub Release
         env:
           REPO: ${{ github.repository }}
@@ -48,54 +49,54 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${REPO}/releases/tags/${ASSETS_TAG}")"
 
-          list_assets() { echo "$rel_json" | jq -r '(.assets // [])[].name'; }
+          echo "Assets on ${ASSETS_TAG}:"
+          echo "$rel_json" | jq -r '(.assets // [])[].name' | sed 's/^/  - /'
 
-          need=(
-            "harbor-offline-installer-${ASSETS_TAG}-amd64.tgz"
-            "harbor-offline-installer-${ASSETS_TAG}-arm64.tgz"
-            "harbor-online-installer-${ASSETS_TAG}-amd64.tgz"
-            "harbor-online-installer-${ASSETS_TAG}-arm64.tgz"
-          )
-          optional=(
-            "harbor-offline-installer-${ASSETS_TAG}-amd64.tgz.sha256"
-            "harbor-offline-installer-${ASSETS_TAG}-arm64.tgz.sha256"
-            "harbor-online-installer-${ASSETS_TAG}-amd64.tgz.sha256"
-            "harbor-online-installer-${ASSETS_TAG}-arm64.tgz.sha256"
-          )
-
-          have="$(list_assets)"
-
-          dl_api() {
-            local name="$1"
-            local url
-            url="$(echo "$rel_json" | jq -r --arg n "$name" '.assets[]? | select(.name==$n) | .browser_download_url')"
-            if [ -n "${url:-}" ] && [ "$url" != "null" ]; then
+          # Find the four .tgz assets by pattern (base tag inferred from filenames)
+          for typ in offline online; do
+            for arch in amd64 arm64; do
+              name="$(echo "$rel_json" \
+                | jq -r --arg typ "$typ" --arg arch "$arch" '
+                    (.assets // [])[].name
+                    | select(test("^harbor-" + $typ + "-installer-.*-" + $arch + "\\.tgz$"))
+                  ' \
+                | head -n1)"
+              if [ -z "$name" ]; then
+                echo "Missing required asset on '${ASSETS_TAG}': harbor-${typ}-installer-<BASE>-${arch}.tgz"
+                exit 1
+              fi
+              url="$(echo "$rel_json" | jq -r --arg n "$name" '
+                      (.assets // [])[] | select(.name==$n) | .browser_download_url')"
               echo "↓ $name"
               curl -fsSL "$url" -o "${assets_path}/${name}"
-              return 0
-            fi
-            return 1
-          }
-
-          for f in "${need[@]}"; do
-            echo "$have" | grep -qx "$f" || { echo "Missing required asset in release '$ASSETS_TAG': $f"; exit 1; }
-            dl_api "$f" || { echo "Failed to download required asset: $f"; exit 1; }
+            done
           done
-          for f in "${optional[@]}"; do
-            if echo "$have" | grep -qx "$f"; then
-              dl_api "$f" || echo "Warn: checksum present but failed to download: $f"
+
+          # Optional checksums
+          for f in "${assets_path}"/*.tgz; do
+            sha="$f.sha256"
+            name="$(basename "$f")"
+            sha_name="$(basename "$sha")"
+            url_sha="$(echo "$rel_json" | jq -r --arg n "$sha_name" '
+                        (.assets // [])[] | select(.name==$n) | .browser_download_url')"
+            if [ -n "${url_sha}" ] && [ "${url_sha}" != "null" ]; then
+              echo "↓ $sha_name"
+              curl -fsSL "$url_sha" -o "$sha"
             else
-              echo "Note: checksum not present (ok): $f"
+              echo "Note: checksum for $name not present (ok)"
             fi
           done
 
           (cd "${assets_path}" && md5sum *.tgz | tee md5sum)
 
+          # Export paths for later steps
           echo "ASSETS_DIR=${assets_path}" >> $GITHUB_ENV
-          echo "OFFLINE_PACKAGE_PATH=${assets_path}/harbor-offline-installer-${ASSETS_TAG}-amd64.tgz" >> $GITHUB_ENV
-          echo "ONLINE_PACKAGE_PATH=${assets_path}/harbor-online-installer-${ASSETS_TAG}-amd64.tgz"   >> $GITHUB_ENV
+          # Pick any of the downloaded names for these two back-compat vars:
+          amd64_off="$(ls -1 ${assets_path}/harbor-offline-installer-*-amd64.tgz | head -n1)"
+          amd64_onl="$(ls -1 ${assets_path}/harbor-online-installer-*-amd64.tgz  | head -n1)"
+          echo "OFFLINE_PACKAGE_PATH=${amd64_off}" >> $GITHUB_ENV
+          echo "ONLINE_PACKAGE_PATH=${amd64_onl}" >> $GITHUB_ENV
           echo "MD5SUM_PATH=${assets_path}/md5sum" >> $GITHUB_ENV
-
       - name: Setup Docker
         uses: docker-practice/actions-setup-docker@master
         with:
