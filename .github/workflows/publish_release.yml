@@ -26,9 +26,83 @@ jobs:
 
       - name: Select tag
         run: |
-          TAG="${{ github.event.inputs.release_tag || github.ref_name }}"
+          RAW="${{ github.event.inputs.release_tag || github.ref_name }}"
+          # trim leading/trailing whitespace
+          TAG="$(printf '%s' "$RAW" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+          # derive a base tag used inside filenames (your files use v2.14.0-test)
+          BASE_TAG="$(printf '%s' "$TAG" | sed -E 's/(-arm64-online|-online|-rc[0-9]+)?$//')"
           echo "TAG=$TAG" >> $GITHUB_ENV
+          echo "BASE_TAG=$BASE_TAG" >> $GITHUB_ENV
+          echo "Using TAG=$TAG  BASE_TAG=$BASE_TAG"
+      
+      - name: Prepare Assets (amd64 + arm64) — robust download
+        env:
+          REPO: ${{ github.repository }}
+          TAG:  ${{ env.TAG }}
+          BASE: ${{ env.BASE_TAG }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          assets_path="$PWD/assets"
+          mkdir -p "$assets_path"
+          echo "Using release tag: $TAG  (filenames use base: $BASE)"
 
+          # Try to list assets; if it fails, rel_json will be empty and we’ll use fallbacks.
+          rel_json="$(curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/releases/tags/${TAG}" || true)"
+
+          pick_name() {
+            # $1 = kind (offline|online), $2 = arch (amd64|arm64)
+            kind="$1"; arch="$2"
+            # Prefer API: find a name that matches ^harbor-(off|on)line-installer-.*-<arch>.tgz
+            if [ -n "$rel_json" ]; then
+              n="$(echo "$rel_json" | jq -r --arg kind "$kind" --arg arch "$arch" \
+                  '.assets[]? | select(.name|test("^harbor-" + $kind + "-installer-.*-" + $arch + "\\.tgz$")) | .name' | head -n1)"
+              if [ -n "$n" ] && [ "$n" != "null" ]; then
+                echo "$n"; return 0
+              fi
+            fi
+            # Fallback to the constructed filename using BASE tag embedded in your files
+            echo "harbor-${kind}-installer-${BASE}-${arch}.tgz"
+          }
+
+          download() {
+            name="$1"
+            # Try API-provided browser_download_url first (if we have rel_json)
+            if [ -n "$rel_json" ]; then
+              api_url="$(echo "$rel_json" | jq -r --arg name "$name" '.assets[]? | select(.name==$name) | .browser_download_url')"
+            else
+              api_url=""
+            fi
+
+            if [ -n "$api_url" ] && [ "$api_url" != "null" ]; then
+              echo "→ downloading via API url: $name"
+              curl -fL -H "Authorization: Bearer ${GH_TOKEN}" "$api_url" -o "${assets_path}/${name}" && return 0
+            fi
+
+            # Direct URL fallback
+            fallback_url="https://github.com/${REPO}/releases/download/${TAG}/${name}"
+            echo "→ API url not found; trying direct URL: $fallback_url"
+            curl -fL -H "Authorization: Bearer ${GH_TOKEN}" "$fallback_url" -o "${assets_path}/${name}"
+          }
+
+          # Resolve names and download all four installers
+          OFF_AMD64="$(pick_name offline amd64)";  download "$OFF_AMD64"
+          OFF_ARM64="$(pick_name offline arm64)";  download "$OFF_ARM64"
+          ON_AMD64="$(pick_name online  amd64)";  download "$ON_AMD64"
+          ON_ARM64="$(pick_name online  arm64)";  download "$ON_ARM64"
+
+          # generate md5 list (optional but nice)
+          (cd "${assets_path}" && md5sum *.tgz | tee md5sum)
+
+          # Export paths with the actual names we resolved
+          echo "ASSETS_DIR=${assets_path}" >> $GITHUB_ENV
+          echo "OFFLINE_PACKAGE_PATH=${assets_path}/${OFF_AMD64}" >> $GITHUB_ENV
+          echo "ONLINE_PACKAGE_PATH=${assets_path}/${ON_AMD64}"   >> $GITHUB_ENV
+          echo "CUR_TAG=${TAG}"  >> $GITHUB_ENV
+          echo "PRERELEASE=false" >> $GITHUB_ENV
       
       - name: Prepare Assets (amd64 + arm64) — from Release (API + direct URL fallback)
         env:
