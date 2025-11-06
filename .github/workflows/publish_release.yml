@@ -4,6 +4,11 @@ on:
   push:
     tags: ['v*.*.*']
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release tag to pull assets from"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -19,10 +24,14 @@ jobs:
       # - name: Setup env (remove or point to your repo)
       #   run: echo "PRERELEASE=false" >> $GITHUB_ENV
 
+      - name: Select tag
+        run: |
+          TAG="${{ github.event.inputs.release_tag || github.ref_name }}"
+          echo "TAG=$TAG" >> $GITHUB_ENV
       - name: Prepare Assets (amd64 + arm64) — from GitHub Release
         env:
           REPO: ${{ github.repository }}
-          TAG:  ${{ github.ref_name }}
+          TAG:  ${{ env.TAG }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
@@ -65,34 +74,28 @@ jobs:
           CUR_TAG: ${{ env.CUR_TAG }}
         run: |
           set -euo pipefail
+          docker login -u "${{ secrets.DOCKER_HUB_USERNAME }}" -p "${{ secrets.DOCKER_HUB_PASSWORD }}"
           : > "$GITHUB_WORKSPACE/_images_all.txt"
-
           for arch in amd64 arm64; do
             pkg="$PWD/assets/harbor-offline-installer-${CUR_TAG}-${arch}.tgz"
             echo "Processing $pkg"
             tar -zxf "$pkg"
             docker load -i ./harbor/harbor.*.tar.gz
 
-            # collect images that match your namespace + tag
+            # collect your images
             mapfile -t imgs < <(docker images --format "{{.Repository}}:{{.Tag}}" | grep "^ranichowdary/.\\+:${CUR_TAG}$" || true)
 
-            # ensure per-arch tags exist (repo:tag-arch) for manifest step
+            # retag and push arch-suffixed tags
             for it in "${imgs[@]}"; do
               repo="${it%:*}"
               docker tag "${it}" "${repo}:${CUR_TAG}-${arch}"
-              echo "${repo}" >> "$GITHUB_WORKSPACE/_images_all.txt"
-            done
-
-            source tools/release/release_utils.sh
-            # push the suffixed tags
-            for it in "${imgs[@]}"; do
-              repo="${it%:*}"
               docker push "${repo}:${CUR_TAG}-${arch}"
+              echo "${repo}" >> "$GITHUB_WORKSPACE/_images_all.txt"
             done
 
             rm -rf harbor
           done
-          
+          docker logout          
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
