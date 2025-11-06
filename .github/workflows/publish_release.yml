@@ -33,7 +33,6 @@ jobs:
           echo "CUR_TAG=$PUBLISH_TAG"  >> $GITHUB_ENV
           echo "ASSETS_TAG=$ASSETS_TAG" >> $GITHUB_ENV
 
-      
       - name: Prepare Assets (amd64 + arm64) — from GitHub Release
         env:
           REPO: ${{ github.repository }}
@@ -57,16 +56,15 @@ jobs:
             for arch in amd64 arm64; do
               name="$(echo "$rel_json" \
                 | jq -r --arg typ "$typ" --arg arch "$arch" '
-                    (.assets // [])[].name
-                    | select(test("^harbor-" + $typ + "-installer-.*-" + $arch + "\\.tgz$"))
-                  ' \
-                | head -n1)"
+                  (.assets // [])[].name
+                  | select(test("^harbor-" + $typ + "-installer-.*-" + $arch + "\\.tgz$"))
+                ' | head -n1)"
               if [ -z "$name" ]; then
                 echo "Missing required asset on '${ASSETS_TAG}': harbor-${typ}-installer-<BASE>-${arch}.tgz"
                 exit 1
               fi
-              url="$(echo "$rel_json" | jq -r --arg n "$name" '
-                      (.assets // [])[] | select(.name==$n) | .browser_download_url')"
+              url="$(echo "$rel_json" \
+                | jq -r --arg n "$name" '(.assets // [])[] | select(.name==$n) | .browser_download_url')"
               echo "↓ $name"
               curl -fsSL "$url" -o "${assets_path}/${name}"
             done
@@ -77,8 +75,8 @@ jobs:
             sha="$f.sha256"
             name="$(basename "$f")"
             sha_name="$(basename "$sha")"
-            url_sha="$(echo "$rel_json" | jq -r --arg n "$sha_name" '
-                        (.assets // [])[] | select(.name==$n) | .browser_download_url')"
+            url_sha="$(echo "$rel_json" \
+              | jq -r --arg n "$sha_name" '(.assets // [])[] | select(.name==$n) | .browser_download_url')"
             if [ -n "${url_sha}" ] && [ "${url_sha}" != "null" ]; then
               echo "↓ $sha_name"
               curl -fsSL "$url_sha" -o "$sha"
@@ -91,19 +89,24 @@ jobs:
 
           # Export paths for later steps
           echo "ASSETS_DIR=${assets_path}" >> $GITHUB_ENV
-          # Pick any of the downloaded names for these two back-compat vars:
+
+          # *** REQUIRED for the publish step ***
+          echo "OFFLINE_AMD64=$(ls -1 ${assets_path}/harbor-offline-installer-*-amd64.tgz | head -n1)" >> $GITHUB_ENV
+          echo "OFFLINE_ARM64=$(ls -1 ${assets_path}/harbor-offline-installer-*-arm64.tgz | head -n1)" >> $GITHUB_ENV
+
+          # Back-compat variables (not strictly required but kept)
           amd64_off="$(ls -1 ${assets_path}/harbor-offline-installer-*-amd64.tgz | head -n1)"
           amd64_onl="$(ls -1 ${assets_path}/harbor-online-installer-*-amd64.tgz  | head -n1)"
           echo "OFFLINE_PACKAGE_PATH=${amd64_off}" >> $GITHUB_ENV
           echo "ONLINE_PACKAGE_PATH=${amd64_onl}" >> $GITHUB_ENV
           echo "MD5SUM_PATH=${assets_path}/md5sum" >> $GITHUB_ENV
+
       - name: Setup Docker
         uses: docker-practice/actions-setup-docker@master
         with:
           docker_version: 20.10
           docker_channel: stable
 
-      
       - name: Publish Images (amd64 + arm64)
         env:
           CUR_TAG: ${{ env.CUR_TAG }}
@@ -120,7 +123,6 @@ jobs:
             echo "Processing offline bundle: ${pkg}"
             tar -zxf "$pkg"
 
-            # find inner tar (name varies: harbor.*.tar.gz)
             inner_tar="$(ls -1 harbor/harbor*.tar.gz | head -n1 || true)"
             if [ -z "${inner_tar}" ]; then
               echo "ERROR: No harbor*.tar.gz inside $(basename "$pkg"). Did you upload ONLINE instead of OFFLINE?"
@@ -128,11 +130,9 @@ jobs:
             fi
             docker load -i "$inner_tar"
 
-            # collect your repos tagged with CUR_TAG (ranichowdary/*:v2.14.0-test)
             mapfile -t imgs < <(docker images --format '{{.Repository}}:{{.Tag}}' \
               | grep "^ranichowdary/.\\+:${CUR_TAG}$" || true)
 
-            # retag with -arch suffix and push
             for it in "${imgs[@]}"; do
               repo="${it%:*}"
               docker tag  "${it}" "${repo}:${CUR_TAG}-${arch}"
@@ -145,6 +145,7 @@ jobs:
 
           sort -u "$GITHUB_WORKSPACE/_repos.txt" -o "$GITHUB_WORKSPACE/_repos.txt"
           docker logout
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
@@ -165,7 +166,6 @@ jobs:
           done < "$GITHUB_WORKSPACE/_repos.txt"
           docker logout
 
-      
       - name: GA Release (re-attach installers to publish tag if needed)
         uses: softprops/action-gh-release@v2
         with:
