@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Publish as this tag (default: ref tag)"
+        description: "Publish images/manifests as this tag (default: ref tag)"
         required: false
         type: string
       assets_tag:
@@ -24,20 +24,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # (OPTIONAL) remove this entire step if you don't need BUILD_NO/PRE_TAG from upstream
-      # - name: Setup env (remove or point to your repo)
-      #   run: echo "PRERELEASE=false" >> $GITHUB_ENV
-
       - name: Select tags
         run: |
           PUBLISH_TAG="${{ github.event.inputs.release_tag || github.ref_name }}"
           ASSETS_TAG="${{ github.event.inputs.assets_tag }}"
-          # trim just in case
           PUBLISH_TAG="$(echo -n "$PUBLISH_TAG" | xargs)"
           ASSETS_TAG="$(echo -n "$ASSETS_TAG" | xargs)"
           echo "CUR_TAG=$PUBLISH_TAG"  >> $GITHUB_ENV
           echo "ASSETS_TAG=$ASSETS_TAG" >> $GITHUB_ENV
-          # derive BASE_TAG by removing leading 'v' if present 
 
       - name: Prepare Assets (amd64 + arm64) — from GitHub Release
         env:
@@ -49,7 +43,6 @@ jobs:
           assets_path="$PWD/assets"
           mkdir -p "$assets_path"
 
-          # Fetch release JSON for the tag that HOLDS the files
           rel_json="$(curl -fsSL \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
@@ -84,13 +77,10 @@ jobs:
             return 1
           }
 
-          # Required files: fail if missing
           for f in "${need[@]}"; do
             echo "$have" | grep -qx "$f" || { echo "Missing required asset in release '$ASSETS_TAG': $f"; exit 1; }
             dl_api "$f" || { echo "Failed to download required asset: $f"; exit 1; }
           done
-
-          # Optional checksum files
           for f in "${optional[@]}"; do
             if echo "$have" | grep -qx "$f"; then
               dl_api "$f" || echo "Warn: checksum present but failed to download: $f"
@@ -102,11 +92,50 @@ jobs:
           (cd "${assets_path}" && md5sum *.tgz | tee md5sum)
 
           echo "ASSETS_DIR=${assets_path}" >> $GITHUB_ENV
-          # Back-compat variables (point to amd64, not critical)
           echo "OFFLINE_PACKAGE_PATH=${assets_path}/harbor-offline-installer-${ASSETS_TAG}-amd64.tgz" >> $GITHUB_ENV
           echo "ONLINE_PACKAGE_PATH=${assets_path}/harbor-online-installer-${ASSETS_TAG}-amd64.tgz"   >> $GITHUB_ENV
-          echo "MD5SUM_PATH=${assets_path}/md5sum" >> $GITHUB_ENV 
-      
+          echo "MD5SUM_PATH=${assets_path}/md5sum" >> $GITHUB_ENV
+
+      - name: Setup Docker
+        uses: docker-practice/actions-setup-docker@master
+        with:
+          docker_version: 20.10
+          docker_channel: stable
+
+      - name: Publish Images (amd64 + arm64)
+        env:
+          CUR_TAG: ${{ env.CUR_TAG }}
+          ASSETS_TAG: ${{ env.ASSETS_TAG }}
+        run: |
+          set -euo pipefail
+          docker login -u "${{ secrets.DOCKER_HUB_USERNAME }}" -p "${{ secrets.DOCKER_HUB_PASSWORD }}"
+          : > "$GITHUB_WORKSPACE/_repos.txt"
+
+          for arch in amd64 arm64; do
+            pkg="$PWD/assets/harbor-offline-installer-${ASSETS_TAG}-${arch}.tgz"
+            echo "Processing $pkg"
+            tar -zxf "$pkg"
+
+            inner_tar="$(ls -1 harbor/harbor*.tar.gz | head -n1)"
+            docker load -i "$inner_tar"
+
+            mapfile -t imgs < <(docker images --format "{{.Repository}}:{{.Tag}}" \
+              | grep "^ranichowdary/.\\+:" || true)
+
+            # Retag every loaded image as :${CUR_TAG}-${arch}, and push
+            for it in "${imgs[@]}"; do
+              repo="${it%:*}"
+              docker tag "${it}" "${repo}:${CUR_TAG}-${arch}"
+              docker push "${repo}:${CUR_TAG}-${arch}"
+              echo "${repo}" >> "$GITHUB_WORKSPACE/_repos.txt"
+            done
+
+            rm -rf harbor
+          done
+
+          sort -u "$GITHUB_WORKSPACE/_repos.txt" -o "$GITHUB_WORKSPACE/_repos.txt"
+          docker logout
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
@@ -126,96 +155,11 @@ jobs:
               "${repo}:${CUR_TAG}-arm64"
           done < "$GITHUB_WORKSPACE/_repos.txt"
           docker logout
-            
-      - name: Publish Images (amd64 + arm64)
-        env:
-          CUR_TAG: ${{ env.CUR_TAG }}
-          ASSETS_TAG: ${{ env.ASSETS_TAG }}
-        run: |
-          set -euo pipefail
-          docker login -u "${{ secrets.DOCKER_HUB_USERNAME }}" -p "${{ secrets.DOCKER_HUB_PASSWORD }}"
-          : > "$GITHUB_WORKSPACE/_repos.txt"
 
-          for arch in amd64 arm64; do
-            pkg="$PWD/assets/harbor-offline-installer-${ASSETS_TAG}-${arch}.tgz"
-            echo "Processing $pkg"
-            tar -zxf "$pkg"
-
-            # The tar inside the bundle can be named harbor.<something>.tar.gz; pick it dynamically
-            inner_tar="$(ls -1 harbor/harbor*.tar.gz | head -n1)"
-            docker load -i "$inner_tar"
-
-            # collect your repos with the PUBLISH tag
-            mapfile -t imgs < <(docker images --format "{{.Repository}}:{{.Tag}}" \
-              | grep "^ranichowdary/.\\+:${CUR_TAG}$" || true)
-
-            # retag and push arch-suffixed tags
-            for it in "${imgs[@]}"; do
-              repo="${it%:*}"
-              docker tag "${it}" "${repo}:${CUR_TAG}-${arch}"
-              docker push "${repo}:${CUR_TAG}-${arch}"
-              echo "${repo}" >> "$GITHUB_WORKSPACE/_repos.txt"
-            done
-
-            rm -rf harbor
-          done
-
-          sort -u "$GITHUB_WORKSPACE/_repos.txt" -o "$GITHUB_WORKSPACE/_repos.txt"
-          docker logout
-
-      
-      
-      - name: Publish Images (amd64 + arm64)
-        env:
-          CUR_TAG: ${{ env.CUR_TAG }}
-        run: |
-          set -euo pipefail
-          docker login -u "${{ secrets.DOCKER_HUB_USERNAME }}" -p "${{ secrets.DOCKER_HUB_PASSWORD }}"
-          : > "$GITHUB_WORKSPACE/_images_all.txt"
-          for arch in amd64 arm64; do
-            pkg="$PWD/assets/harbor-offline-installer-${CUR_TAG}-${arch}.tgz"
-            echo "Processing $pkg"
-            tar -zxf "$pkg"
-            docker load -i ./harbor/harbor.*.tar.gz
-
-            # collect your images
-            mapfile -t imgs < <(docker images --format "{{.Repository}}:{{.Tag}}" | grep "^ranichowdary/.\\+:${CUR_TAG}$" || true)
-
-            # retag and push arch-suffixed tags
-            for it in "${imgs[@]}"; do
-              repo="${it%:*}"
-              docker tag "${it}" "${repo}:${CUR_TAG}-${arch}"
-              docker push "${repo}:${CUR_TAG}-${arch}"
-              echo "${repo}" >> "$GITHUB_WORKSPACE/_images_all.txt"
-            done
-
-            rm -rf harbor
-          done
-          docker logout          
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        with:
-          install: true
-
-      - name: Create multi-arch manifests (Docker Hub)
-        run: |
-          set -euo pipefail
-          cur=${{ env.CUR_TAG }}
-          mapfile -t repos < <(sort -u "$GITHUB_WORKSPACE/_images_all.txt")
-          echo "Repos to manifest: ${#repos[@]}"
-          docker login -u "${{ secrets.DOCKER_HUB_USERNAME }}" -p "${{ secrets.DOCKER_HUB_PASSWORD }}"
-          for repo in "${repos[@]}"; do
-            echo "Creating manifest ${repo}:${cur}"
-            docker buildx imagetools create \
-              -t ${repo}:${cur} \
-              ${repo}:${cur}-amd64 \
-              ${repo}:${cur}-arm64
-          done
-          docker logout
-
-      - name: GA Release
+      - name: GA Release (re-attach installers to publish tag if needed)
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.CUR_TAG }}
           body: "Automated publish from fork validation"
           files: |
             ${{ env.ASSETS_DIR }}/harbor-offline-installer-*-amd64.tgz
